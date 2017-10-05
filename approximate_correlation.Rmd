@@ -1,0 +1,355 @@
+---
+title: "Approximating a correlation matrix"
+author: "Andrew MacDonald"
+date: "7 September 2017"
+output: 
+  html_document:
+    theme: readable
+bibliography: approx_corr.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, message = FALSE)
+library(rstan)
+library(rethinking)
+library(tidyverse)
+library(vegan)
+library(rstanarm)
+library(ggplot2)
+```
+
+## The goal
+
+> Can we accurately recover a simulated correlation matrix, using random effects and/or latent variable models?
+
+In community ecology we often want to model species abundances, usually as a "response" to the environment or some manipulation. But species do not respond to anything alone, but often show correlated responses. These correlations can be encouraged by mutualisms, facilitation and competition etc -- even other, unmeasured environmental variables. Or all of these at once! It's a fun challenge. 
+
+Given that these effects exist, any attempt to model community composition should include this non-independence. One way to do this is to estimate correlated effects for each species, based on their abundances in different samples (perhaps after accounting for their different site effects). These models are described in detail in Warton et al. [-@Warton2015-qi].
+
+$$
+y = F(\mu_{ij}, \phi)
+$$
+
+$$
+g(\mu_{ij}) =  \alpha_i + \beta_{0j} + \mathbf x' \mathbf B_j + u_{ij}
+$$
+
+$$ 
+u_{ij} \sim N(\mathbf 0 , \mathbf \Sigma)
+$$
+
+Warton et al. [@Warton2015-qi]  discuss how to approximate a correlation matrix using a simple "latent variable" approach. This approach can work with less data -- often we have too many species, and/or too little data from the field, to estimate the correlation matrix directly. 
+
+Here I am going to start with a known correlation matrix and then try to recover it based on a few different models. 
+
+## Simulating data
+
+First I generate a correlation matrix:
+
+* draw a correlation matrix from the LKJ distribution.
+* draw species means from a lognormal distribution
+* draw species variances from a uniform distribution
+* finally draw species abundances from a multivariate normal distribution, defined by these correlations, means, and variances. Let's say we sample 10 sites.
+
+```{r}
+# normal distribution -- its biomass or something!
+
+number_of_species <- 3
+
+set.seed(4812)
+# species correlation
+sppcors <- rethinking::rlkjcorr(1, K = number_of_species, eta = 1.5)
+
+# variance of each species
+# sppvars <- runif(5, min = 1, max = 1.5)
+# actually not using this; this is a complication that can be added later if I want. 
+
+# lognormal abundances
+sppmeans <- rlnorm(number_of_species, log(17))
+
+## sample the species -- using a constant variace in each species of 0.7
+spp_lambdas <- MASS::mvrnorm(n = 100, mu = sppmeans,
+                             Sigma = 
+                               diag(0.7, number_of_species) %*% 
+                               sppcors %*% 
+                               diag(0.7, number_of_species))
+
+# reshaping the data: the dataset needs a bit of massaging to be useful later
+species_sites <- spp_lambdas %>% 
+  as.data.frame %>%
+  set_names(paste0("sp", LETTERS[1:number_of_species])) %>% 
+  rownames_to_column("site") %>% 
+  gather(spp, true_mean, -site) %>% 
+  arrange(site) %>% 
+  # I are using a multivariate normal distribution to sample "average abundances". Actually sampling abundances from a poisson like normal.  I suppose these will be overdispersed, in fact, because the average that they are based on is itself variable. 
+  mutate(obs_abd = map_dbl(true_mean, rpois, n = 1)) %>% 
+  # add index for species
+  mutate(spp_id  = rethinking::coerce_index(spp),
+         site_id = rethinking::coerce_index(site))
+
+knitr::kable(head(species_sites))
+```
+
+So now I have poisson counts of species abundances, which are correlated with each other, and sampled a few times.
+
+_ as an aside, I suppose that the means that these poisson counts were based on could also be the response variable we are considering. So we might say that the first represents biomass, the second counts (suppose, e.g. that these are plants and size and fecundity are perfectly related to each other)._
+
+### Visualizing the fake data
+
+Let's use a simple visualization to see if this works as I suspect. I'm going to visualize the abundance data using NMDS from the vegan package.
+
+```{r message=FALSE, warning=FALSE}
+sol_spp <- species_sites %>% 
+  select(site, spp, obs_abd) %>% 
+  spread(spp, obs_abd) %>% 
+  remove_rownames %>% 
+  column_to_rownames("site") %>% 
+  as.matrix %>% 
+  decostand("hellinger") %>% 
+  metaMDS()
+
+plot(sol_spp, type = "t")
+```
+
+This should be consistent with the correlation matrix that started it all:
+
+```{r}
+dimnames(sppcors) <- replicate(2, set_names(paste0("sp", LETTERS[1:5])), simplify = FALSE)
+corrplot::corrplot(sppcors)
+```
+
+My intuition has always been that the distances between species on an NMDS plot were related to the strength of their correlation. But if that is true, shouldn't A and C be much closer together? Though I suppose that they are quite close on the first axis, and perhaps the two axes should not be "taken literally". 
+
+With fewer taxa it is possible to check the distribution directly, to see covariance that way..
+
+```{r}
+species_sites %>% ggplot(aes(x = spp, y = obs_abd, fill = spp, group = site)) + 
+  geom_line(alpha = 0.1)+
+  geom_point(pch = 21) +
+  scale_fill_viridis_d() + 
+  scale_y_log10()
+```
+
+This will come in handy when we use posterior predictive checks.
+
+Wait this isnt quite what I expected! maybe a `pairs` plot would make more sense here??
+
+
+```{r}
+species_sites %>% glimpse %>% 
+  select(site, spp, obs_abd) %>% 
+  spread(spp, obs_abd) %>% 
+  select(-site) %>% 
+  GGally::ggpairs(.)
+
+# I could also imagine a tidyverse-style solution here, where we use expand.grid to create all the pairings, join in the raw data, then create the plots using facet-wrap or something. the advatage would be to be able to easily draw the trendlines.
+
+# doesn't widyr do something like this? 
+```
+
+## via rstanarm
+
+The most direct means is also the least likely to work. Here is the form of the model wherein the entire covariance matrix is estimated from the data. This uses a simplified version of the model formula proposed in the appendix of Warton et al. 
+
+```{r rstanarm-model}
+fit_stan_ranspp <- stan_glmer(obs_abd ~ 0 + 
+                                (1 | spp) +
+                                (1 | site) + 
+                                (0 + spp | site),
+                              data=species_sites, family="poisson", chains = 1)
+
+
+```
+
+```{r rstanarm-effects}
+VarCorr(fit_stan_ranspp)
+
+sppcors
+```
+
+That.. doesn't look very good! the correlation values are all very far away from the original numbers! 
+
+Maybe it doesn't all gotta be bayesian? Wardon et al originally went with `lme4`. 
+
+```{r lme4-model}
+library(lme4)
+fit.glmm = glmer(obs_abd ~ 0 + 
+                   (1 | spp) +
+                   (1 | site) + 
+                   (0 + spp | site),
+                 data=species_sites, family=poisson(link = "log"))
+
+summary(fit.glmm)
+sppcors
+```
+
+At least this worked (it won't always "converge", thanks to the small sample size)
+
+## via boral
+
+Of course, the authors of these papers offer their own means of accomplishing these ends: `boral`, which is an R package
+
+```{r boral-model}
+
+# need to make a species x site matrix firxt
+
+species_sites_forboral <- species_sites %>% 
+  select(spp, site, obs_abd) %>% 
+  spread(spp, obs_abd) %>% 
+  select(-site) %>% 
+  as.data.frame
+
+library(boral)
+fit.lvm <- boral(y = species_sites_forboral, # X = covX, # no X values used!
+                 num.lv = 2, family = "poisson",
+                 row.eff = "random", save.model = TRUE,
+                 calc.ics = F, hypparams = c(20,20,20,20))
+
+## Dunn-Smyth residual plots  to check model assumption, outliers etc...
+plot(fit.lvm)
+
+## Please note that boral currently does not automatically produce biplots, although species loadings can be obtained from fit.lvm$lv.coefs.median[,2:3]
+lvsplot(fit.lvm)
+
+
+## Use corrplot package to plot residual correlations between species, e.g. possibly due to species interaction etc...
+res.cors <- get.residual.cor(fit.lvm)
+corrplot::corrplot(res.cors$cor, diag = F, type = "lower", title = "Residual correlations from LVM", tl.srt = 45)
+corrplot::corrplot(sppcors, diag = F, type = "lower", title = "original", tl.srt = 45)
+```
+
+I... don't get why these are not the same. In these data there *aren't* anything but residual correlations! should these two figures resemble each other? 
+
+## via Stan
+
+If I'm totally honest, my preference would be to write one of these models in Stan. Because I have several use cases in mind, but I might need more flexibility than boral provides right now. On the other hand, perhaps it is better not to get too "creative"..
+
+Frankly, Stan is something that I have gotten used to using, and I would rather keep everything in the same tool if I possibly could! 
+
+## Taking the easy way -- `rethinking`
+
+I can't tell, but shouldn't it be possible to fit this with `rethinking`? 
+
+```{r rethinking-model, eval=FALSE}
+
+simple_model <- alist(
+  obs_abd   ~  dpois(lamb),
+  log(lamb) <- inter +
+    site_intercept[site_id] + 
+    spp_intercept[spp_id],
+  inter                    ~ dnorm(0, 5),
+  # distribution of sites
+  site_intercept[site_id]  ~ dnorm(0, sitevar),
+  sitevar                  ~ dcauchy(0, 4),
+  # distribution of species
+  spp_intercept[spp_id]    ~ dnorm(0, sppvar),
+  sppvar                   ~ dcauchy(0, 4)
+)
+library(rstan)
+test_model <- rethinking::map2stan(simple_model, species_sites)
+# rethinking::stancode(test_model)
+summary(test_model)
+
+```
+
+No, it is not, but `rethinking` does help by creating Stan code that I can then edit by hand. 
+
+
+```
+data{
+    int<lower=1> N;
+    int<lower=1> N_site_id;
+    int<lower=1> N_spp_id;
+    int obs_abd[N];
+    int spp_id[N];
+    int site_id[N];
+}
+parameters{
+    real inter;
+    vector[N_site_id] site_intercept;
+    real<lower=0> sitevar;
+    vector[N_spp_id] spp_intercept;
+    real<lower=0> sppvar;
+    // adding this part: latent variables? is that you?
+    matrix[N_site_id, 2] latent_vars;
+    matrix[2, N_spp_id] spp_loadings;
+}
+model{
+    vector[N] lamb;
+    sppvar ~ cauchy( 0 , 4 );
+    spp_intercept ~ normal( 0 , sppvar );
+    sitevar ~ cauchy( 0 , 4 );
+    site_intercept ~ normal( 0 , sitevar );
+    inter ~ normal( 0 , 5 );
+    // latent variable priors??
+    for (j in 1:N_site_id){
+      for(k in 1:2 ){
+        latent_vars[j, k] ~ normal(0, 1);
+      }
+    }
+    // and the species loadings?
+    for (j in 1:N_spp_id){
+      for(k in 1:2 ){
+        spp_loadings[k, j] ~ normal(0, 3);
+      }
+    }
+    // add the row of 
+    for ( i in 1:N ) {
+        lamb[i] = inter + site_intercept[site_id[i]] + spp_intercept[spp_id[i]] + latent_vars[site_id[i],] * spp_loadings[,spp_id[i]];
+    }
+    obs_abd ~ poisson_log( lamb );
+}
+generated quantities{
+    vector[N] lamb;
+    real dev;
+    dev = 0;
+    for ( i in 1:N ) {
+        lamb[i] = inter + site_intercept[site_id[i]] + spp_intercept[spp_id[i]];
+    }
+    dev = dev + (-2)*poisson_log_lpmf( obs_abd | lamb );
+}
+```
+
+
+
+```{r message=FALSE}
+# prepare data
+knitr::kable(head(species_sites))
+
+data_for_stan <- list(obs_abd  = species_sites$obs_abd,
+                      site_id  = species_sites$site_id,
+                      spp_id   = species_sites$spp_id,
+                      N = nrow(species_sites),
+                      N_site_id = length(unique(species_sites$site_id)),
+                      N_spp_id = length(unique(species_sites$spp_id)))
+
+results_lv_stan <- stan("lv_based_on_rethinking.stan", data = data_for_stan, chains = 2)
+
+list_of_draws <- rstan::extract(results_lv_stan)
+
+str(list_of_draws$spp_loadings)
+
+median_loadings <- apply(list_of_draws$spp_loadings, c(2,3), median)
+```
+
+Now we have posterior draws from the $\Lambda$ matrix, which, apparently, if multiplied together would give an approximation of the covariance matrix..
+
+```{r}
+t(median_loadings) %*% median_loadings
+```
+
+These numbers are the right shape (5 x 5) but their values are WAY too small! Evidentently I am missing a step here. 
+I understand that `boral` applys some kind of "scale" to these values. Clearly I'm missing that here. 
+
+## Conclusions (?)
+
+There's not much success to report here. None of these approaches really nailed the experience of reproducing a covariance matrix. 
+
+### Obvious next steps
+
+Exactly how bad are these approaches? They probably do better with more samples -- how much better?   
+Assuming that the approaches I'm taking here are actually valid, this could be the foundation for a power analysis of some kind. 
+
+While I can write something in Stan that runs, and seems to do what is required, I can't manage to interpret the results in the same way as the boral output.
+
+## References

@@ -1,0 +1,260 @@
+---
+title: "Approximating a correlation matrix"
+author: "Andrew MacDonald"
+date: "October 4, 2017"
+output: 
+  html_document:
+    theme: readable
+bibliography: approx_corr.bib
+---
+
+## Intro
+
+In ecology we often want to try to model multiple correlated responses -- for example, many species occurances across several samples. In models like this, it's important to include the correlation between responses in the model (at least, according to some authors). However, when you have a lot of species and not many samples, this can get out of hand quickly. 
+
+One solution, proposed by Warton et al [-@Warton2015-qi] is to use a *latent variable model*, which they describe like this:
+
+$$
+g(m_{ij}) = \alpha_i + \beta_{0j} + \mathbf{x}_{i}'\beta_j + u_{ij}
+$$
+
+$$
+u_{ij} = \mathbf{z}'_{i}\lambda_{j}
+$$
+
+
+They implement this technique in an R package `boral` which contains functions which write JAGS code for the user. I would like to write this myself for two reasons: 1) I'd like to understand exactly why this works 2) I want/need to extend this a bit, and I'd like to have the flexibility of having working code that I can extend. 
+
+My attempt to work this out is inspired a lot by Rick Farouni's [blog on this topic (or a related topic)?](https://rfarouni.github.io/2015-04-26-fa/). Rick is also mentioned in the Stan manual on page 178, in connection with constructing Cholesky factors.
+
+### Simulating data
+
+To test that this method works the way I think it ought to, I am going to simulate some data as if it came from a survey of some ecological community. Then see if I can get the "true" values out at the end. 
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+require(rethinking)
+
+number_of_species <- 3
+
+set.seed(4812)
+# species correlation
+sppcors <- rethinking::rlkjcorr(1, K = number_of_species, eta = 1.5)
+
+# variance of each species
+# sppvars <- runif(5, min = 1, max = 1.5)
+# actually not using this; this is a complication that can be added later if I want. 
+
+# lognormal abundances
+sppmeans <- rlnorm(number_of_species, log(17))
+
+## sample the species -- using a constant variace in each species of 0.7
+spp_lambdas <- MASS::mvrnorm(n = 100, mu = sppmeans,
+                             Sigma = 
+                               diag(0.7, number_of_species) %*% 
+                               sppcors %*% 
+                               diag(0.7, number_of_species))
+
+# reshaping the data: the dataset needs a bit of massaging to be useful later
+species_sites <- spp_lambdas %>% 
+  as.data.frame %>%
+  set_names(paste0("sp", LETTERS[1:number_of_species])) %>% 
+  rownames_to_column("site") %>% 
+  gather(spp, true_mean, -site) %>% 
+  arrange(site) %>% 
+  # I am using a multivariate normal distribution to sample "average abundances". Actually sampling abundances from a poisson like normal.  I suppose these will be overdispersed, in fact, because in addition to the variation inherent in the poisson distribution there is also variation in the mean effects from the normal distribution. 
+  mutate(obs_abd = map_dbl(true_mean, rpois, n = 1)) %>% 
+  # add index for species
+  mutate(spp_id  = rethinking::coerce_index(spp),
+         site_id = rethinking::coerce_index(site))
+
+knitr::kable(head(species_sites))
+
+```
+
+This is an example for `r number_of_species` species, which were counted at 100 sites. Note the `id` columns, made with the help of the `rethinking` package.
+
+### Stan model
+
+Below is a copy of the Stan code I used to do this (not the actual code used to do it, which is in [this file](test_combined_model.R))
+
+```
+data{
+    int<lower=1> N;
+    int<lower=1> N_site_id;
+    int<lower=1> N_spp_id;
+    int obs_abd[N];
+    int spp_id[N];
+    int site_id[N];
+    int<lower=2> D;              // number of latent dimensions 
+}
+transformed data {
+  int<lower=1> M;
+  // We calculate the number of below-zero loadings 
+  // the second term is the number in the "square part" below diag
+  // the first term is the "non square part" below that
+  M  = D * (N_spp_id - D) + D * (D-1)/2;  // number of non-zero loadings
+}
+parameters{
+    real inter;
+    vector[N_site_id] site_intercept;
+    real<lower=0> sitevar;
+    vector[N_spp_id] spp_intercept;
+    real<lower=0> sppvar;
+    // adding this part: latent variables? is that you?
+    matrix[N_site_id, D] latent_vars;
+    // matrix[2, N_spp_id] spp_loadings;
+    // blog parameters
+    vector[M] spp_load_L_t;   // lower diagonal elements of L = spp_loadings
+    vector<lower=0>[D] spp_load_L_d;   // diagonal elements of L = spp_loadings
+   // vector<lower=0>[N_spp_id] psi;         // vector of variances
+    // hyperparameters
+    //real<lower=0>   mu_psi;
+    //real<lower=0>  sigma_psi;
+    // real   mu_lt;
+    // real<lower=0>  sigma_lt;
+}
+transformed parameters{
+  cholesky_factor_cov[N_spp_id,D] spp_loadings;  //lower triangular factor loadings Matrix 
+  {
+    int idx2;
+    idx2 = 1;
+    for(i in 1:N_spp_id){
+      for(j in (i+1):D){
+        spp_loadings[i,j] = 0; //constrain the upper triangular elements to zero 
+      }
+    }
+    for (j in 1:D) {
+      // add the diagonal elements
+      spp_loadings[j,j] = spp_load_L_d[j];
+      for (k in (j+1):N_spp_id) {
+        // add the lower triangular elements
+        spp_loadings[k,j] = spp_load_L_t[idx2];
+        idx2 = idx2 + 1;
+      } 
+    }
+  } 
+}
+model{
+    vector[N] lamb;
+    // the hyperpriors 
+    // mu_psi ~ cauchy(0, 1);
+    // sigma_psi ~ cauchy(0,1);
+    // mu_lt ~ cauchy(0, 1);
+    // sigma_lt ~ cauchy(0,1);
+    // the priors 
+    // note that spp_load_L_d is constrained with lower=0
+    spp_load_L_d ~ cauchy(0,3);
+    spp_load_L_t ~ cauchy(0, 4);
+    // psi ~ cauchy(mu_psi,sigma_psi);
+    sppvar ~ cauchy( 0 , 4 );
+    spp_intercept ~ normal( 0 , sppvar );
+    sitevar ~ cauchy( 0 , 4 );
+    site_intercept ~ normal( 0 , sitevar );
+    inter ~ normal( 0 , 5 );
+    // latent variable priors??
+    for (j in 1:N_site_id){
+      for(k in 1:D ){
+        latent_vars[j, k] ~ normal(0, 1);
+      }
+    }
+    // the liklihood
+    // add the row of 
+    for ( i in 1:N ) {
+        lamb[i] = inter + site_intercept[site_id[i]] + spp_intercept[spp_id[i]] + latent_vars[site_id[i],] * spp_loadings[spp_id[i],]';
+    }
+    obs_abd ~ poisson_log( lamb );
+}
+generated quantities{
+    vector[N] lamb;
+    matrix[N_spp_id,N_spp_id] Q;   //Covariance mat
+    real dev;
+    dev = 0;
+    for ( i in 1:N ) {
+        lamb[i] = inter + site_intercept[site_id[i]] + spp_intercept[spp_id[i]] + latent_vars[site_id[i],] * spp_loadings[spp_id[i],]';
+    }
+    dev = dev + (-2)*poisson_log_lpmf( obs_abd | lamb );
+    //add the correlation matrix in here! Q = L*L'
+    Q = spp_loadings * spp_loadings'; //+ diag_matrix(psi);
+    // OK this gives me an error when I declare that Q needs to be positive definite, by using cov_matrix[N_spp_id]
+}
+```
+
+### using the model and checking output
+
+```{r define_model, cache=TRUE, message=FALSE}
+
+data_for_stan <- list(obs_abd  = species_sites$obs_abd,
+                      site_id  = species_sites$site_id,
+                      spp_id   = species_sites$spp_id,
+                      N = nrow(species_sites),
+                      N_site_id = length(unique(species_sites$site_id)),
+                      N_spp_id = length(unique(species_sites$spp_id)),
+                      D = 2)
+
+model_lv_stan <- stan_model("combined_blog_rethinking_model.stan")
+```
+
+Here I run sampling on the model. I am using only one chain and quite unintelligent starting values; perhaps this is part of the problem?
+
+```{r sample, cache=TRUE}
+results_lv_stan <- sampling(model_lv_stan,data = data_for_stan, chains = 1, init = 0)
+```
+
+And finally try to obtain the correlation matrix from these data..
+
+```{r}
+
+list_of_draws <- rstan::extract(results_lv_stan)
+
+str(list_of_draws$spp_loadings)
+
+median_loadings <- apply(list_of_draws$spp_loadings, c(2,3), median)
+
+## i think this is supposed to be an estimate of the correlation matrix, 
+##.. but the diagonal is not even close to 1
+
+median_loadings %*% t(median_loadings)
+## compare with the real data..
+sppcors
+# well... the signs are in the right direction anyways??
+
+```
+
+
+```{r}
+median_latent <- apply(list_of_draws$latent_vars, c(2,3), median)
+
+species_obs_matrix <- species_sites %>% 
+  dplyr::select(site, spp, obs_abd) %>% 
+  spread(spp, obs_abd) %>% 
+  select(-site)
+
+species_obs_matrix %>% 
+  prcomp %>%
+  biplot
+
+# via vegan
+suppressPackageStartupMessages(library(vegan))
+
+decor_sites <- species_obs_matrix %>% 
+  decorana()
+
+post_crustes <- procrustes(decor_sites, median_latent, scale = TRUE)
+
+plot(post_crustes)
+
+par(mfrow = c(1, 2))
+plot(decor_sites, display = "sites")
+title("DCA of simulated data")
+plot(post_crustes$Yrot[,1:2])
+title("a best guess??")
+
+```
+
+
+## References

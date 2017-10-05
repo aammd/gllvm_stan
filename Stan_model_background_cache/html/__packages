@@ -1,0 +1,10 @@
+base
+dplyr
+tidyr
+purrr
+tibble
+ggplot2
+StanHeaders
+rstan
+rethinking
+bindrcpp
